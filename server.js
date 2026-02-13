@@ -11,19 +11,27 @@ const wss = new WebSocket.Server({ server });
 app.use(cors());
 app.use(express.json());
 
+// ===== CONFIG =====
+const WEB_CLIENT_URL = 'https://web-client-pi-two.vercel.app/';
+// ===================
+
 // Store active connections
 const clients = new Map();
 const streams = new Map();
 
-// REST API endpoints
+// -------- REST API --------
 app.get('/', (req, res) => {
   res.send(`
     <h1>WebRTC Signaling Server</h1>
     <p>Status: Running ✓</p>
     <p>Active Clients: ${clients.size}</p>
     <p>Active Streams: ${streams.size}</p>
-    <p><strong>To view streams, go to: <a href="http://${req.headers.host.split(':')[0]}:3001">Web Client</a></strong></p>
-    <p>WebSocket endpoint: ws://${req.headers.host}</p>
+    <p><strong>Open Web Client:</strong>
+      <a href="${WEB_CLIENT_URL}" target="_blank">
+        ${WEB_CLIENT_URL}
+      </a>
+    </p>
+    <p>WebSocket endpoint: <strong>wss://${req.headers.host}</strong></p>
   `);
 });
 
@@ -45,91 +53,58 @@ app.get('/api/streams', (req, res) => {
   res.json({ streams: streamList });
 });
 
-// WebSocket connection handler
+// -------- WebSocket --------
 wss.on('connection', (ws) => {
   const clientId = uuidv4();
-  console.log(`New client connected: ${clientId}`);
+  console.log(`Client connected: ${clientId}`);
 
   clients.set(clientId, {
     id: clientId,
-    ws: ws,
-    type: null, // 'streamer' or 'viewer'
+    ws,
+    type: null,
     streamId: null
   });
+
+  ws.send(JSON.stringify({
+    type: 'connected',
+    clientId
+  }));
 
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
       handleMessage(clientId, data);
-    } catch (error) {
-      console.error('Error parsing message:', error);
-      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
+    } catch (err) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
     }
   });
 
-  ws.on('close', () => {
-    handleDisconnect(clientId);
-  });
-
-  ws.on('error', (error) => {
-    console.error(`WebSocket error for client ${clientId}:`, error);
-  });
-
-  // Send welcome message with client ID
-  ws.send(JSON.stringify({
-    type: 'connected',
-    clientId: clientId
-  }));
+  ws.on('close', () => handleDisconnect(clientId));
+  ws.on('error', () => handleDisconnect(clientId));
 });
 
+// -------- Message Router --------
 function handleMessage(clientId, data) {
-  const client = clients.get(clientId);
-  if (!client) return;
-
-  console.log(`Message from ${clientId}:`, data.type);
-
   switch (data.type) {
-    case 'register-streamer':
-      handleRegisterStreamer(clientId, data);
-      break;
-
-    case 'register-viewer':
-      handleRegisterViewer(clientId, data);
-      break;
-
-    case 'offer':
-      handleOffer(clientId, data);
-      break;
-
-    case 'answer':
-      handleAnswer(clientId, data);
-      break;
-
-    case 'ice-candidate':
-      handleIceCandidate(clientId, data);
-      break;
-
-    case 'stop-stream':
-      handleStopStream(clientId);
-      break;
-
-    default:
-      console.log(`Unknown message type: ${data.type}`);
+    case 'register-streamer': return registerStreamer(clientId, data);
+    case 'register-viewer': return registerViewer(clientId, data);
+    case 'offer': return relay(clientId, data, 'offer');
+    case 'answer': return relay(clientId, data, 'answer');
+    case 'ice-candidate': return relay(clientId, data, 'ice-candidate');
+    case 'stop-stream': return stopStream(clientId);
   }
 }
 
-function handleRegisterStreamer(clientId, data) {
+// -------- Streamer --------
+function registerStreamer(clientId, data) {
   const client = clients.get(clientId);
   const streamId = data.streamId || uuidv4();
 
-  // Check if streamId is already in use by another ACTIVE streamer
   if (streams.has(streamId)) {
-    console.log(`Registration failed: Stream ID '${streamId}' is already in use.`);
-    client.ws.send(JSON.stringify({
+    return client.ws.send(JSON.stringify({
       type: 'error',
-      message: `Stream ID '${streamId}' is already in use. Please choose another name.`
+      message: 'Stream ID already exists'
     }));
-    return;
   }
 
   client.type = 'streamer';
@@ -142,147 +117,90 @@ function handleRegisterStreamer(clientId, data) {
     viewers: new Set()
   });
 
-  console.log(`Streamer registered: ${clientId}, stream: ${streamId}`);
-
   client.ws.send(JSON.stringify({
     type: 'registered',
     role: 'streamer',
-    streamId: streamId,
-    embedUrl: `${getBaseUrl()}?streamId=${streamId}`
+    streamId,
+    embedUrl: `${WEB_CLIENT_URL}?streamId=${streamId}`
   }));
+
+  console.log(`Streamer ${clientId} → ${streamId}`);
 }
 
-function handleRegisterViewer(clientId, data) {
+// -------- Viewer --------
+function registerViewer(clientId, data) {
   const client = clients.get(clientId);
-  const streamId = data.streamId;
+  const stream = streams.get(data.streamId);
 
-  if (!streamId || !streams.has(streamId)) {
-    client.ws.send(JSON.stringify({
+  if (!stream) {
+    return client.ws.send(JSON.stringify({
       type: 'error',
       message: 'Stream not found'
     }));
-    return;
   }
 
   client.type = 'viewer';
-  client.streamId = streamId;
-
-  const stream = streams.get(streamId);
+  client.streamId = data.streamId;
   stream.viewers.add(clientId);
-
-  console.log(`Viewer registered: ${clientId}, stream: ${streamId}`);
 
   client.ws.send(JSON.stringify({
     type: 'registered',
     role: 'viewer',
-    streamId: streamId
+    streamId: data.streamId
   }));
 
-  // Notify streamer about new viewer
   const streamer = clients.get(stream.streamerId);
-  if (streamer && streamer.ws.readyState === WebSocket.OPEN) {
-    streamer.ws.send(JSON.stringify({
-      type: 'viewer-joined',
-      viewerId: clientId
-    }));
-  }
+  streamer?.ws.send(JSON.stringify({
+    type: 'viewer-joined',
+    viewerId: clientId
+  }));
 }
 
-function handleOffer(clientId, data) {
-  const targetId = data.targetId;
-  const target = clients.get(targetId);
+// -------- WebRTC Relay --------
+function relay(senderId, data, type) {
+  const target = clients.get(data.targetId);
+  if (!target) return;
 
-  if (target && target.ws.readyState === WebSocket.OPEN) {
-    target.ws.send(JSON.stringify({
-      type: 'offer',
-      offer: data.offer,
-      senderId: clientId
-    }));
-  }
+  target.ws.send(JSON.stringify({
+    type,
+    senderId,
+    [type === 'ice-candidate' ? 'candidate' : type]: data[type]
+  }));
 }
 
-function handleAnswer(clientId, data) {
-  const targetId = data.targetId;
-  const target = clients.get(targetId);
-
-  if (target && target.ws.readyState === WebSocket.OPEN) {
-    target.ws.send(JSON.stringify({
-      type: 'answer',
-      answer: data.answer,
-      senderId: clientId
-    }));
-  }
-}
-
-function handleIceCandidate(clientId, data) {
-  const targetId = data.targetId;
-  const target = clients.get(targetId);
-
-  if (target && target.ws.readyState === WebSocket.OPEN) {
-    target.ws.send(JSON.stringify({
-      type: 'ice-candidate',
-      candidate: data.candidate,
-      senderId: clientId
-    }));
-  }
-}
-
-function handleStopStream(clientId) {
+// -------- Stop Stream --------
+function stopStream(clientId) {
   const client = clients.get(clientId);
-  if (!client || !client.streamId) return;
+  if (!client?.streamId) return;
 
   const stream = streams.get(client.streamId);
   if (!stream) return;
 
-  // Notify all viewers
   stream.viewers.forEach(viewerId => {
     const viewer = clients.get(viewerId);
-    if (viewer && viewer.ws.readyState === WebSocket.OPEN) {
-      viewer.ws.send(JSON.stringify({
-        type: 'stream-ended'
-      }));
-    }
+    viewer?.ws.send(JSON.stringify({ type: 'stream-ended' }));
   });
 
   streams.delete(client.streamId);
-  console.log(`Stream ended: ${client.streamId}`);
 }
 
+// -------- Disconnect --------
 function handleDisconnect(clientId) {
   const client = clients.get(clientId);
   if (!client) return;
 
-  console.log(`Client disconnected: ${clientId}`);
+  if (client.type === 'streamer') stopStream(clientId);
 
-  if (client.type === 'streamer' && client.streamId) {
-    handleStopStream(clientId);
-  } else if (client.type === 'viewer' && client.streamId) {
+  if (client.type === 'viewer') {
     const stream = streams.get(client.streamId);
-    if (stream) {
-      stream.viewers.delete(clientId);
-
-      // Notify streamer
-      const streamer = clients.get(stream.streamerId);
-      if (streamer && streamer.ws.readyState === WebSocket.OPEN) {
-        streamer.ws.send(JSON.stringify({
-          type: 'viewer-left',
-          viewerId: clientId
-        }));
-      }
-    }
+    stream?.viewers.delete(clientId);
   }
 
   clients.delete(clientId);
 }
 
-function getBaseUrl() {
-  const port = process.env.PORT || 3000;
-  return process.env.PUBLIC_URL || `http://localhost:${port}`;
-}
-
+// -------- Start Server --------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Signaling server running on port ${PORT}`);
-  console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
+  console.log(`Signaling Server running on port ${PORT}`);
 });
